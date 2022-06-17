@@ -2,10 +2,8 @@ import torch
 
 import pytorch_lightning as pl
 import torch.optim as optim
-from .experience_source_dataset import ExperienceSourceDataset
+from .batch import Batch
 from .networks import create_mlp, ActorCriticAgent, ActorCategorical
-
-from digest = T
 
 import numpy as np
 
@@ -40,7 +38,6 @@ class PolicyGradient(pl.LightningModule):
 
         self.agent = ActorCriticAgent(self.actor, self.critic)
         self._reset()
-
 
     def _reset(self):
         self.batch_states = []
@@ -106,54 +103,18 @@ class PolicyGradient(pl.LightningModule):
         rews = rewards + [last_value]
         vals = values + [last_value]
 
-        # this is the generalized advantage estimation https://nn.labml.ai/rl/ppo/gae.html
+        # generalized advantage estimation https://nn.labml.ai/rl/ppo/gae.html
         return [rews[i] + self.gamma * vals[i + 1] - vals[i] for i in range(len(rews) - 1)]
 
     def _dataloader(self) -> DataLoader:
         """Initialize the Replay Buffer dataset used for retrieving experiences"""
-        dataset = ExperienceSourceDataset(self.train_batch)
+        dataset = Batch(self.train_batch)
         dataloader = DataLoader(dataset=dataset, batch_size=self.batch_size)
         return dataloader
 
     def train_dataloader(self) -> DataLoader:
         """Get train loader"""
         return self._dataloader()
-
-    @staticmethod
-    def weighted_quantilee(values, weiights, q, epsilon):
-        """
-        Computes the weighted quantile, equivalent to the exact quantile of the
-        empirical distribution.
-
-        Given ordered samples x_1 <= ... <= x_n, with corresponding weights w_1,
-        ..., w_n, where sum_i(w_i) = 1.0, the weighted quantile is the minimum x_i
-        for which the cumulative sum up to x_i is greater than or equal to 1.
-
-        Quantile = min{ x_i | x_1 + ... + x_i >= q }
-        """
-
-        sorted_indices = np.argsort(values)
-        sorted_weights = weights[sorted_indices]
-        sorted_values = values[sorted_indices]
-        cum_sorted_weights = np.cumsum(sorted_weights)
-        i_quantile = np.argmax(cum_sorted_weights >= q)
-        quantile = sorted_values[i_quantile]
-
-        # NOTE: This implementation is equivalent to (but much faster than) the
-        # following:
-        # from scipy import stats
-        # empirical_dist = stats.rv_discrete(name='empirical_dist', values=(values, weights))
-        # quantile = empirical_dist.ppf(q)
-
-        return quantile
-
-    def risk_seeking_policy_gradient(self, epsilon, episodes):
-        N = len(episodes)
-
-        sample_w = np.repeat((1 - memory_w.sum()) / N, N)
-        combined_w = np.concatenate([memory_w, sample_w])
-
-        quantile = self.weighted_quantile(values=combined_r, weights=combined_w, q=1 - epsilon)
 
     def train_batch(self, ) -> tuple:
         """
@@ -202,10 +163,10 @@ class PolicyGradient(pl.LightningModule):
                 self.state = torch.FloatTensor(self.env.reset())
 
             if epoch_end:
-                #TODO: not fancy but obvious insertion point for risk aware policy batching 
+                # TODO: not fancy but obvious insertion point for risk aware policy batching
 
-
-                train_data = zip(self.batch_states, self.batch_actions, self.batch_logp, self.batch_qvals, self.batch_adv)
+                train_data = zip(self.batch_states, self.batch_actions, self.batch_logp, self.batch_qvals,
+                                 self.batch_adv)
 
                 for state, action, logp_old, qval, adv in train_data:
                     yield state, action, logp_old, qval, adv

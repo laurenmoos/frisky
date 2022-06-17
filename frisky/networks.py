@@ -61,6 +61,8 @@ class ActorCriticAgent(object):
     """
 
     def __init__(self, actor_net: nn.Module, critic_net: nn.Module):
+
+        #TODO: shouldn't this be the same network?
         self.actor_net = actor_net
         self.critic_net = critic_net
 
