@@ -2,10 +2,7 @@ import torch
 
 import pytorch_lightning as pl
 import torch.optim as optim
-from .batch import Batch
-from .networks import ActorCriticAgent, ActorCategorical
-
-import numpy as np
+from batch import Batch
 
 from typing import List
 
@@ -14,7 +11,9 @@ from torch.utils.data import DataLoader
 
 class RiskAwarePPO(pl.LightningModule):
 
-    def __init__(self, env, agent, updates, epochs, batch_size, steps_per_epoch, risk_aware, value_loss_coef,
+    def __init__(self, env, agent, epochs, steps_per_epoch, tr_policy_iter, tr_value_iter, learning_rate,
+                 risk_aware,
+                 value_loss_coef,
                  entropy_beta,
                  clip_ratio):
         super().__init__()
@@ -22,10 +21,15 @@ class RiskAwarePPO(pl.LightningModule):
         self.env = env
         self.agent = agent
 
-        self.updates = updates
+        self.actor = agent.actor_net
+        self.lr_actor = learning_rate[0]
+        self.critic = agent.critic_net
+        self.lr_critic = learning_rate[1]
+
         self.epochs = epochs
-        self.batch_size = batch_size
         self.steps_per_epoch = steps_per_epoch
+        self.tr_policy_iter = tr_policy_iter
+        self.tr_value_iter = tr_value_iter
 
         self.risk_aware = risk_aware
         self.value_loss_coef = value_loss_coef
@@ -37,6 +41,7 @@ class RiskAwarePPO(pl.LightningModule):
         self._reset()
 
     def _reset(self):
+        # TODO: at some point encapsulate this in a buffer
         self.batch_states = []
         self.batch_actions = []
         self.batch_adv = []
@@ -52,7 +57,7 @@ class RiskAwarePPO(pl.LightningModule):
         self.avg_ep_len = 0
         self.avg_reward = 0
 
-        self.state = self.env.reset()
+        self.state = torch.tensor(self.env.reset())
 
     def configure_optimizers(self) -> tuple:
         """
@@ -64,12 +69,7 @@ class RiskAwarePPO(pl.LightningModule):
         return optimizer_actor, optimizer_critic
 
     def optimizer_step(self, *args, **kwargs):
-        """
-        Run 'nb_optim_iters' number of iterations of gradient descent on actor and critic
-        for each sample of test data.
-        """
-        for i in range(self.nb_optim_iters):
-            super().optimizer_step(*args, **kwargs)
+        super().optimizer_step(*args, **kwargs)
 
     def forward(self, x: torch.Tensor) -> tuple:
         """
@@ -101,95 +101,90 @@ class RiskAwarePPO(pl.LightningModule):
         vals = values + [last_value]
 
         # generalized advantage estimation https://nn.labml.ai/rl/ppo/gae.html
-        return [rews[i] + self.gamma * vals[i + 1] - vals[i] for i in range(len(rews) - 1)]
+        return [rews[i] + self.value_loss_coef * vals[i + 1] - vals[i] for i in range(len(rews) - 1)]
 
     def _dataloader(self) -> DataLoader:
         """Initialize the Replay Buffer dataset used for retrieving experiences"""
         dataset = Batch(self.train_batch)
-        dataloader = DataLoader(dataset=dataset, batch_size=self.batch_size)
+        dataloader = DataLoader(dataset=dataset, batch_size=self.steps_per_epoch)
         return dataloader
 
     def train_dataloader(self) -> DataLoader:
         """Get train loader"""
         return self._dataloader()
 
-    def train(self, ) -> tuple:
-        """
-        generate candidate programs and evaluate them for nearness to the ground truth observed input, output tuples
-        associated with the task
-        """
-        for update in updates:
-            for step in range(self.steps_per_epoch * self.epochs):
-                pi, action, log_prob, value = self.agent(self.state.float(), self.device)
-                next_state, reward, done, _ = self.env.step(action.cpu().numpy())
-                self.episode_step += 1
+    def train_batch(self, ) -> tuple:
+        for step in range(self.steps_per_epoch * self.epochs):
+            pi, action, log_prob, value = self.agent(self.state.float(), self.device)
+            next_state, reward, done, _ = self.env.step(action.cpu().numpy())
+            self.episode_step += 1
 
-                self.batch_states.append(self.state)
-                self.batch_actions.append(action)
-                self.batch_logp.append(log_prob)
-                self.ep_rewards.append(reward)
-                # value is sampled float scalar from the critic network
-                self.ep_values.append(value.item())
+            self.batch_states.append(self.state)
+            self.batch_actions.append(action)
+            self.batch_logp.append(log_prob)
+            self.ep_rewards.append(reward)
+            # value is sampled float scalar from the critic network
+            self.ep_values.append(value.item())
 
-                self.state = next_state
+            self.state = torch.tensor(next_state)
 
-                epoch_end = step == (self.steps_per_epoch - 1)
-                # has a reward been collected for each instruction added to the sequence
-                terminal = len(self.ep_rewards) == self.sequence_length
+            epoch_end = step == (self.steps_per_epoch - 1)
+            # has a reward been collected for each instruction added to the sequence
+            terminal = len(self.ep_rewards) == self.steps_per_epoch
 
-                if epoch_end or done or terminal:
-                    # if trajectory ends abruptly, boostrap value of next state
-                    if (terminal or epoch_end) and not done:
-                        with torch.no_grad():
-                            _, _, _, value = self.agent(self.state, self.device)
-                            last_value = value
-                            steps_before_cutoff = self.episode_step
-                    else:
-                        last_value = 0
-                        steps_before_cutoff = 0
+            if epoch_end or done or terminal:
+                # if trajectory ends abruptly, boostrap value of next state
+                if (terminal or epoch_end) and not done:
+                    with torch.no_grad():
+                        _, _, _, value = self.agent(self.state, self.device)
+                        last_value = value
+                        steps_before_cutoff = self.episode_step
+                else:
+                    last_value = 0
+                    steps_before_cutoff = 0
 
-                    # cumulative reward via the program state held by the environment
-                    self.batch_qvals += self.discount_rewards(self.ep_rewards + [last_value], self.gamma)[:-1]
-                    # advantage
-                    self.batch_adv += self.calc_advantage(self.ep_rewards, self.ep_values, last_value)
-                    # logs
-                    self.epoch_rewards.append(sum(self.ep_rewards))
-                    # reset params
-                    self.ep_rewards = []
-                    self.ep_values = []
-                    self.episode_step = 0
-                    self.state = torch.FloatTensor(self.env.reset())
+                # cumulative reward via the program state held by the environment
+                self.batch_qvals += self.discount_rewards(self.ep_rewards + [last_value], self.value_loss_coef)[:-1]
+                # advantage
+                self.batch_adv += self.calc_advantage(self.ep_rewards, self.ep_values, last_value)
+                # logs
+                self.epoch_rewards.append(sum(self.ep_rewards))
+                # reset params
+                self.ep_rewards = []
+                self.ep_values = []
+                self.episode_step = 0
+                self.state = torch.FloatTensor(self.env.reset())
 
-                if epoch_end:
-                    # TODO: not fancy but obvious insertion point for risk aware policy batching
+            if epoch_end:
+                # TODO: not fancy but obvious insertion point for risk aware policy batching
 
-                    train_data = zip(self.batch_states, self.batch_actions, self.batch_logp, self.batch_qvals,
-                                     self.batch_adv)
+                train_data = zip(self.batch_states, self.batch_actions, self.batch_logp, self.batch_qvals,
+                                 self.batch_adv)
 
-                    for state, action, logp_old, qval, adv in train_data:
-                        yield state, action, logp_old, qval, adv
+                for state, action, logp_old, qval, adv in train_data:
+                    yield state, action, logp_old, qval, adv
 
-                    self.batch_states.clear()
-                    self.batch_actions.clear()
-                    self.batch_adv.clear()
-                    self.batch_logp.clear()
-                    self.batch_qvals.clear()
+                self.batch_states.clear()
+                self.batch_actions.clear()
+                self.batch_adv.clear()
+                self.batch_logp.clear()
+                self.batch_qvals.clear()
 
-                    # logging
-                    self.avg_reward = sum(self.epoch_rewards) / self.steps_per_epoch
+                # logging
+                self.avg_reward = sum(self.epoch_rewards) / self.steps_per_epoch
 
-                    # if epoch ended abruptly, exclude last cut-short episode to prevent stats skewness
-                    epoch_rewards = self.epoch_rewards
-                    if not done:
-                        epoch_rewards = epoch_rewards[:-1]
+                # if epoch ended abruptly, exclude last cut-short episode to prevent stats skewness
+                epoch_rewards = self.epoch_rewards
+                if not done:
+                    epoch_rewards = epoch_rewards[:-1]
 
-                    total_epoch_reward = sum(epoch_rewards)
-                    nb_episodes = len(epoch_rewards)
+                total_epoch_reward = sum(epoch_rewards)
+                nb_episodes = len(epoch_rewards)
 
-                    self.avg_ep_reward = total_epoch_reward / nb_episodes
-                    self.avg_ep_len = (self.steps_per_epoch - steps_before_cutoff) / nb_episodes
+                self.avg_ep_reward = total_epoch_reward / nb_episodes
+                self.avg_ep_len = (self.steps_per_epoch - steps_before_cutoff) / nb_episodes
 
-                    self.epoch_rewards.clear()
+                self.epoch_rewards.clear()
 
     def actor_loss(self, state, action, logp_old, adv) -> torch.Tensor:
         pi, _ = self.actor(state)
@@ -218,15 +213,13 @@ class RiskAwarePPO(pl.LightningModule):
         self.log("avg_reward", self.avg_reward, prog_bar=True, on_step=False, on_epoch=True)
 
         if optimizer_idx == 0:
-            loss_actor = self.actor_loss(state, action, old_logp, adv)
-            self.log('loss_actor', loss_actor, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-
+            for i in range(max(1, self.tr_policy_iter)):
+                loss_actor = self.actor_loss(state, action, old_logp, adv)
             return loss_actor
 
         elif optimizer_idx == 1:
-            loss_critic = self.critic_loss(state, qval)
-            self.log('loss_critic', loss_critic, on_step=False, on_epoch=True, prog_bar=False, logger=True)
-
+            for i in range(max(1, self.tr_value_iter)):
+                loss_critic = self.critic_loss(state, qval)
             return loss_critic
 
     def get_device(self, batch) -> str:
