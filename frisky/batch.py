@@ -13,8 +13,8 @@ class Batch(IterableDataset):
 
     def __iter__(self):
         return self.generate_batch()
-        batch = self.generate_batch()
-        self.digest.batch_update(batch)
-
-        #TODO: make this configurable
-        return self.digest.percentile(15)
+        # batch = self.generate_batch()
+        # self.digest.batch_update(batch)
+        #
+        # #TODO: make this configurable
+        # return self.digest.percentile(15)
