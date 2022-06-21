@@ -25,8 +25,7 @@ def main(hparams):
     agent = ActorCriticAgent(actor, critic_network)
     if not _GYM_AVAILABLE:
         raise ModuleNotFoundError('This Module requires gym environment which is not installed yet.')
-    train_policy_iterations = 80
-    train_value_iterations = 80
+
     model = RiskAwarePPO(
         env,
         agent,
